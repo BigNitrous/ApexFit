@@ -3881,6 +3881,12 @@ SHEETS.settings = () => {
       <label class="field">Daily water goal (liters)<input class="input" id="set-water" type="number" inputmode="decimal" step="0.1" min="0.5" data-in="set-water" value="${r1(waterTarget(p) / 1000)}"></label>
       ${!IN_CLAUDE ? `<label class="field">USDA FoodData Central key (optional)<input class="input" id="set-usda" data-in="set-usda" autocomplete="off" spellcheck="false" placeholder="Uses the shared demo key" value="${esc(usdaKey() === 'DEMO_KEY' ? '' : usdaKey())}"></label>
       <p class="tiny">Barcode scans fill in nutrition from Open Food Facts and USDA FoodData Central. The shared demo key allows about 30 USDA lookups an hour; a free key from api.data.gov raises that to 1,000. Foods you've scanned once are saved and never looked up again.</p>` : ''}</div>
+    <div class="card stack"><div class="eyebrow">Apple Health sync</div>
+      <p class="tiny">Automatic, through the Health Auto Export app and your own free relay. Setup steps are in the app's README on GitHub.</p>
+      <label class="field">Relay address<input class="input" id="hs-url" data-in="hs-url" inputmode="url" autocomplete="off" spellcheck="false" placeholder="https://apexfit-health.yourname.workers.dev" value="${esc(hsCfg().url || '')}"></label>
+      <label class="field">Token<input class="input" id="hs-token" data-in="hs-token" autocomplete="off" spellcheck="false" placeholder="The secret you chose" value="${esc(hsCfg().token || '')}"></label>
+      ${hsCfg().last ? `<p class="tiny">Last synced ${new Date(hsCfg().last).toLocaleString()}${hsCfg().steps ? ` · today ${hsCfg().steps.toLocaleString()} steps` : ''}${hsCfg().kcal ? `, ${hsCfg().kcal} active kcal` : ''}</p>` : ''}${hsCfg().err ? `<p class="small" role="status">${esc(hsCfg().err)}</p>` : ''}
+      <div class="row"><button class="btn sm primary" data-a="hs-sync">Sync now</button><button class="btn sm ghost" data-a="hs-off">Turn off</button></div></div>
     <div class="card stack"><div class="eyebrow">Your data</div>
       <p class="small">${Store.mode === 'cloud' ? 'Saved privately to your Claude account, so it follows you across devices where you open this app. Only you can see it.' : IN_CLAUDE ? 'Saved in this browser only. Open the app while signed in to Claude to sync it.' : 'Saved on this device. Export a backup now and then.'}</p>
       <div class="grid2"><button class="btn" data-a="export">Export backup</button><label class="btn">Restore backup<input type="file" accept="application/json,.json" data-ch="import-file" class="hide"></label></div>
@@ -3940,6 +3946,38 @@ IN['import-file'] = async el => {
 };
 A['import-do'] = async () => { await Store.replaceAll(UI.sheet.buckets); closeSheet(); UI.d = null; UI.step = 'landing'; render(); toast('Backup restored'); };
 
+/* Adds weights (kg) and body fat (%) by date; days already logged are kept. */
+function mergeBody(wkg, bf) {
+  const today = todayStr(), W = Object.assign({}, weights()), M = Object.assign({}, measures()); let nw = 0, nb = 0;
+  Object.keys(wkg).forEach(d => { if (d <= today && !W[d] && wkg[d] > 0) { W[d] = Math.round(wkg[d] * 10) / 10; nw++; } });
+  Object.keys(bf).forEach(d => { if (d <= today && !(M[d] && M[d].bf) && bf[d] >= 3 && bf[d] <= 60) { M[d] = Object.assign({}, M[d], {bf: Math.round(bf[d] * 10) / 10}); nb++; } });
+  if (nw) { Store.set('weights', W); const p = P(); saveP(Object.assign({}, p, {weightKg: W[Object.keys(W).sort().pop()]})); }
+  if (nb) Store.set('measure', M);
+  return {nw, nb};
+}
+/* ---------- Apple Health live sync: Health Auto Export -> your relay -> here ---------- */
+const hsCfg = () => { try { return JSON.parse(localStorage.getItem('apexfit:hsync') || 'null') || {}; } catch (e) { return {}; } };
+const hsSave = o => { try { localStorage.setItem('apexfit:hsync', JSON.stringify(Object.assign(hsCfg(), o))); } catch (e) {} };
+let hsBusy = false;
+async function healthSync(quiet) {
+  const c = hsCfg(); if (!c.url || !c.token || hsBusy) return;
+  hsBusy = true;
+  try {
+    const r = await fetch(c.url, {headers: {Authorization: 'Bearer ' + c.token}});
+    if (!r.ok) throw new Error(r.status === 401 ? 'The token was not accepted.' : 'The relay answered ' + r.status + '.');
+    const d = await r.json(), {nw, nb} = mergeBody(d.weights || {}, d.bodyFat || {}), days = Object.keys(d.steps || {}).sort(), t = todayStr();
+    hsSave({last: Date.now(), err: '', steps: d.steps && d.steps[t] || 0, kcal: d.activeKcal && d.activeKcal[t] || 0, data: d.updated || ''});
+    if (nw || nb) render();
+    if (!quiet) toast(nw || nb ? `Synced: ${nw} weigh-in${nw === 1 ? '' : 's'}${nb ? `, ${nb} body fat` : ''}` : 'Already up to date');
+  } catch (e) { const m = e instanceof TypeError ? 'Could not reach the relay. Check the address.' : e.message; hsSave({err: m}); if (!quiet) toast(m); }
+  hsBusy = false; if (UI.sheet && UI.sheet.kind === 'settings') renderSheet();
+}
+A['hs-sync'] = () => { toast('Syncing…'); healthSync(false); };
+A['hs-off'] = () => { try { localStorage.removeItem('apexfit:hsync'); } catch (e) {} renderSheet(); toast('Health sync turned off'); };
+IN['hs-url'] = el => hsSave({url: el.value.trim()});
+IN['hs-token'] = el => hsSave({token: el.value.trim()});
+document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible') healthSync(true); });
+setTimeout(() => healthSync(true), 2500);
 /* ---------- Apple Health import (export.zip / export.xml, parsed on the device) ---------- */
 A['health-open'] = () => openSheet('health', {});
 SHEETS.health = s => sheetFrame('Import from Apple Health', s.done ? `<div class="callout">${ICON.info}<span>${s.done}</span></div><button class="btn primary" data-a="close-sheet">Done</button>`
@@ -3992,12 +4030,9 @@ IN['health-file'] = async el => {
       buf = buf.slice(cut);
       if (done) break;
     }
-    const today = todayStr(), W = Object.assign({}, weights()), M = Object.assign({}, measures()); let nw = 0, nb = 0;
-    Object.keys(wt).forEach(d => { if (d <= today && !W[d]) { W[d] = Math.round(wt[d].v * 10) / 10; nw++; } });
-    Object.keys(bf).forEach(d => { if (d <= today && !(M[d] && M[d].bf) && bf[d].v >= 3 && bf[d].v <= 60) { M[d] = Object.assign({}, M[d], {bf: Math.round(bf[d].v * 10) / 10}); nb++; } });
+    const wk = {}, bk = {}; Object.keys(wt).forEach(d => wk[d] = wt[d].v); Object.keys(bf).forEach(d => bk[d] = bf[d].v);
+    const {nw, nb} = mergeBody(wk, bk);
     if (!nw && !nb) { openSheet('health', {err: seen ? 'Everything in that export is already in ApexFit.' : 'No body weight or body fat entries were found in that file. Log some in Health first, or check that you chose the right export.'}); return; }
-    if (nw) { Store.set('weights', W); const p = P(); saveP(Object.assign({}, p, {weightKg: W[Object.keys(W).sort().pop()]})); }
-    if (nb) Store.set('measure', M);
     render(); openSheet('health', {done: `Added ${nw} weigh-in${nw === 1 ? '' : 's'}${nb ? ` and ${nb} body fat reading${nb === 1 ? '' : 's'}` : ''}.`});
   } catch (e) {
     openSheet('health', {err: e && e.message === 'zip64' ? 'That export is too large to read as a zip. Unzip it in Files and choose export.xml inside the apple_health_export folder.' : e && (e.message === 'zip' || e.message === 'noxml') ? "That doesn't look like an Apple Health export. Choose export.zip (or export.xml)." : 'Could not read that file. If it is a zip, try unzipping it in Files and choosing export.xml.'});

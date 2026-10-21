@@ -42,3 +42,22 @@ Everything is stored on the device (localStorage). Use Settings → Export backu
 
 Food data: built-in foods use typical USDA FoodData Central values; barcode lookups use Open Food Facts (community data, ODbL license) and USDA FoodData Central (public domain, CC0).
 General fitness education, not medical advice.
+
+## Apple Health live sync (Health Auto Export + your own free relay)
+
+Web apps can't read Apple Health, so a small relay sits in between. The Health Auto Export iOS app pushes your Health data to the relay on a schedule, and ApexFit pulls it from the relay whenever you open it. Brings in body weight, body fat, steps and active calories.
+
+**1. Create the relay (free Cloudflare account, about 5 minutes).**
+1. dash.cloudflare.com → Workers & Pages → Create → Create Worker. Name it `apexfit-health`, deploy, then Edit code and paste in `worker/health-relay.js`. Deploy.
+2. Storage & Databases → KV → Create a namespace named `apexfit-health`.
+3. Back in the Worker: Settings → Bindings → Add → KV namespace. Variable name `HEALTH`, pick the namespace you made.
+4. Settings → Variables and Secrets → Add a **Secret** named `TOKEN` and make its value a long random password.
+5. Your relay address is the Worker's `https://apexfit-health.<you>.workers.dev` URL.
+
+**2. Point Health Auto Export at it.** In the app (paid "Premium" plan needed for automations): Automations → New → REST API.
+- URL: your relay address. Method: POST. Format: JSON.
+- Header: `Authorization` = `Bearer ` followed by your token.
+- Data: Health Metrics → Body Mass (weight), Body Fat Percentage, Step Count, Active Energy. Aggregate by **Days**, Summarize **on**.
+- Pick a schedule (hourly works). Use Manual Export once to test.
+
+**3. Connect ApexFit.** Settings → Apple Health sync → paste the relay address and token → Sync now. It then syncs quietly each time you open the app.
