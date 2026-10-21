@@ -3886,6 +3886,7 @@ SHEETS.settings = () => {
       <div class="grid2"><button class="btn" data-a="export">Export backup</button><label class="btn">Restore backup<input type="file" accept="application/json,.json" data-ch="import-file" class="hide"></label></div>
       <div class="tiny">Spreadsheet exports (CSV)</div>
       <div class="row"><button class="btn sm" data-a="csv" data-v="workouts">Workouts</button><button class="btn sm" data-a="csv" data-v="food">Food log</button><button class="btn sm" data-a="csv" data-v="body">Body</button></div>
+      <button class="btn" data-a="health-open">Import from Apple Health</button>
       <button class="btn danger" data-a="reset">${UI.confirm === 'reset' ? 'Tap again to erase everything' : 'Erase all data'}</button></div>
     ${!IN_CLAUDE ? `<div class="card stack"><div class="eyebrow">Install</div>${installEvt ? `<button class="btn primary" data-a="install">Add to home screen</button>` : `<p class="small">${isIOS ? 'In Safari, tap Share, then “Add to Home Screen”.' : 'Use your browser menu and choose “Install app” or “Add to Home screen”.'}</p>`}</div>` : ''}
     <p class="tiny">ApexFit · research notes in the Learn tab · general education, not medical advice.</p>`);
@@ -3938,6 +3939,70 @@ IN['import-file'] = async el => {
   } catch (e) { openSheet('import', {err: "That file isn't an ApexFit or Two Plates backup."}); }
 };
 A['import-do'] = async () => { await Store.replaceAll(UI.sheet.buckets); closeSheet(); UI.d = null; UI.step = 'landing'; render(); toast('Backup restored'); };
+
+/* ---------- Apple Health import (export.zip / export.xml, parsed on the device) ---------- */
+A['health-open'] = () => openSheet('health', {});
+SHEETS.health = s => sheetFrame('Import from Apple Health', s.done ? `<div class="callout">${ICON.info}<span>${s.done}</span></div><button class="btn primary" data-a="close-sheet">Done</button>`
+  : s.busy ? `<p class="small muted" role="status">${esc(s.busy)}</p>`
+  : `<p class="small">Brings your body weight and body fat history into ApexFit, which sharpens your weight trend and measured calorie burn. Days you already logged are kept as they are.</p>
+  <ol class="small stack" style="padding-left:18px;margin:0"><li>In the Health app, tap your picture (top right), then <b>Export All Health Data</b>.</li><li>Save the file to Files (iCloud Drive or On My iPhone).</li><li>Choose it below. It can take a minute for large exports; nothing leaves your phone.</li></ol>
+  <label class="btn primary">Choose export.zip<input type="file" accept=".zip,.xml,application/zip,text/xml" data-ch="health-file" class="hide"></label>${s.err ? `<p class="small" role="status">${esc(s.err)}</p>` : ''}`);
+async function zipEntryStream(file) {
+  const tail = new DataView(await file.slice(Math.max(0, file.size - 65557)).arrayBuffer());
+  let e = -1; for (let i = tail.byteLength - 22; i >= 0; i--) if (tail.getUint32(i, true) === 0x06054b50) { e = i; break; }
+  if (e < 0) throw new Error('zip');
+  const cdSize = tail.getUint32(e + 12, true), cdOff = tail.getUint32(e + 16, true);
+  if (cdOff === 0xffffffff) throw new Error('zip64');
+  const cd = new DataView(await file.slice(cdOff, cdOff + cdSize).arrayBuffer()), dec = new TextDecoder();
+  for (let o = 0; o + 46 <= cd.byteLength && cd.getUint32(o, true) === 0x02014b50;) {
+    const method = cd.getUint16(o + 10, true), csize = cd.getUint32(o + 20, true), nl = cd.getUint16(o + 28, true), xl = cd.getUint16(o + 30, true), cl = cd.getUint16(o + 32, true), lo = cd.getUint32(o + 42, true);
+    const name = dec.decode(new Uint8Array(cd.buffer, o + 46, nl));
+    if (/(^|\/)export\.xml$/.test(name)) {
+      const lh = new DataView(await file.slice(lo, lo + 30).arrayBuffer()), start = lo + 30 + lh.getUint16(26, true) + lh.getUint16(28, true);
+      const raw = file.slice(start, start + csize).stream();
+      if (method === 0) return raw;
+      if (method === 8 && typeof DecompressionStream === 'function') return raw.pipeThrough(new DecompressionStream('deflate-raw'));
+      throw new Error('method');
+    }
+    o += 46 + nl + xl + cl;
+  }
+  throw new Error('noxml');
+}
+IN['health-file'] = async el => {
+  const f = el.files && el.files[0]; if (!f) return;
+  try {
+    openSheet('health', {busy: 'Reading your Health export…'});
+    const isZip = /\.zip$/i.test(f.name) || f.type === 'application/zip';
+    const stream = (isZip ? await zipEntryStream(f) : f.stream()).pipeThrough(new TextDecoderStream());
+    const wt = {}, bf = {}, re = /<Record type="HKQuantityTypeIdentifier(BodyMass|BodyFatPercentage)"[^>]*>/g, at = (t, k) => { const m = t.match(new RegExp(k + '="([^"]*)"')); return m ? m[1] : ''; };
+    const reader = stream.getReader(); let buf = '', seen = 0;
+    for (;;) {
+      const {value, done} = await reader.read();
+      buf += value || '';
+      const cut = done ? buf.length : Math.max(0, buf.lastIndexOf('<'));
+      re.lastIndex = 0; const part = buf.slice(0, cut); let m;
+      while ((m = re.exec(part))) {
+        const d = at(m[0], 'startDate').slice(0, 10), v = Number(at(m[0], 'value')), u = at(m[0], 'unit'), key = d + at(m[0], 'startDate');
+        if (!/^\d{4}-\d\d-\d\d$/.test(d) || !(v > 0)) continue;
+        const tgt = m[1] === 'BodyMass' ? wt : bf;
+        const val = m[1] === 'BodyMass' ? (u === 'lb' ? v * 0.45359237 : u === 'g' ? v / 1000 : v) : (v <= 1 ? v * 100 : v);
+        if (!tgt[d] || key >= tgt[d].k) tgt[d] = {k: key, v: val};
+        seen++;
+      }
+      buf = buf.slice(cut);
+      if (done) break;
+    }
+    const today = todayStr(), W = Object.assign({}, weights()), M = Object.assign({}, measures()); let nw = 0, nb = 0;
+    Object.keys(wt).forEach(d => { if (d <= today && !W[d]) { W[d] = Math.round(wt[d].v * 10) / 10; nw++; } });
+    Object.keys(bf).forEach(d => { if (d <= today && !(M[d] && M[d].bf) && bf[d].v >= 3 && bf[d].v <= 60) { M[d] = Object.assign({}, M[d], {bf: Math.round(bf[d].v * 10) / 10}); nb++; } });
+    if (!nw && !nb) { openSheet('health', {err: seen ? 'Everything in that export is already in ApexFit.' : 'No body weight or body fat entries were found in that file. Log some in Health first, or check that you chose the right export.'}); return; }
+    if (nw) { Store.set('weights', W); const p = P(); saveP(Object.assign({}, p, {weightKg: W[Object.keys(W).sort().pop()]})); }
+    if (nb) Store.set('measure', M);
+    render(); openSheet('health', {done: `Added ${nw} weigh-in${nw === 1 ? '' : 's'}${nb ? ` and ${nb} body fat reading${nb === 1 ? '' : 's'}` : ''}.`});
+  } catch (e) {
+    openSheet('health', {err: e && e.message === 'zip64' ? 'That export is too large to read as a zip. Unzip it in Files and choose export.xml inside the apple_health_export folder.' : e && (e.message === 'zip' || e.message === 'noxml') ? "That doesn't look like an Apple Health export. Choose export.zip (or export.xml)." : 'Could not read that file. If it is a zip, try unzipping it in Files and choosing export.xml.'});
+  }
+};
 A['reset'] = async () => {
   if (UI.confirm !== 'reset') { UI.confirm = 'reset'; renderSheet(); setTimeout(() => { if (UI.confirm === 'reset') { UI.confirm = null; renderSheet(); } }, 4000); return; }
   UI.confirm = null; stopTimer(); await Store.replaceAll({}); closeSheet(); UI.d = null; UI.step = 'landing'; UI.tab = 'today'; render(); toast('All data erased');
